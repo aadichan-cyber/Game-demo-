@@ -1,0 +1,719 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Echoes Below</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+    touch-action: none; user-select: none; -webkit-user-select: none; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(() => {
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Setup
+// ---------------------------------------------------------------------------
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+
+const H = 600;            // logical world height
+const STEP = 10;          // cave sample spacing (px)
+const PING_SPEED = 540;   // echo ring expansion speed
+const PING_MAX = 680;     // echo ring max radius
+const PING_COST = 22;
+const FADE = 2.6;         // seconds an echo stays "remembered"
+const BAT_R = 7;
+
+let W = 800, scale = 1, offY = 0, dpr = 1;
+function resize() {
+  dpr = Math.min(2, window.devicePixelRatio || 1);
+  const vw = innerWidth, vh = innerHeight;
+  scale = Math.min(vh / H, vw / 560);
+  W = vw / scale;
+  offY = (vh - H * scale) / 2;
+  cv.width = Math.round(vw * dpr);
+  cv.height = Math.round(vh * dpr);
+}
+addEventListener('resize', resize);
+resize();
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const lerp = (a, b, t) => a + (b - a) * t;
+
+let best = 0;
+try { best = +localStorage.getItem('echoesBelow.best') || 0; } catch (e) {}
+function saveBest() { try { localStorage.setItem('echoesBelow.best', String(best)); } catch (e) {} }
+
+// ---------------------------------------------------------------------------
+// Audio (all synthesized)
+// ---------------------------------------------------------------------------
+let ac = null, master = null, muted = false;
+function initAudio() {
+  if (ac) { if (ac.state === 'suspended') ac.resume(); return; }
+  try {
+    ac = new (window.AudioContext || window.webkitAudioContext)();
+    master = ac.createGain();
+    master.gain.value = muted ? 0 : 0.55;
+    master.connect(ac.destination);
+  } catch (e) { ac = null; }
+}
+function out(node, pan) {
+  if (ac.createStereoPanner) {
+    const p = ac.createStereoPanner();
+    p.pan.value = clamp(pan || 0, -1, 1);
+    node.connect(p); p.connect(master);
+  } else node.connect(master);
+}
+function tone(f0, f1, dur, vol, type = 'sine', pan = 0, delay = 0) {
+  if (!ac) return;
+  const t = ac.currentTime + delay;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t);
+  if (f1) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + 0.005);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(g); out(g, pan);
+  o.start(t); o.stop(t + dur + 0.03);
+}
+function noiseBurst(dur, vol) {
+  if (!ac) return;
+  const len = Math.floor(ac.sampleRate * dur);
+  const buf = ac.createBuffer(1, len, ac.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len);
+  const src = ac.createBufferSource(); src.buffer = buf;
+  const f = ac.createBiquadFilter(); f.type = 'lowpass';
+  const t = ac.currentTime;
+  f.frequency.setValueAtTime(2400, t);
+  f.frequency.exponentialRampToValueAtTime(80, t + dur);
+  const g = ac.createGain(); g.gain.value = vol;
+  src.connect(f); f.connect(g); g.connect(master);
+  src.start(t);
+}
+const sfx = {
+  ping()   { tone(3400, 1500, 0.09, 0.22); tone(1700, 760, 0.13, 0.07, 'triangle'); },
+  echo(p)  { tone(1500, 950, 0.07, 0.06, 'sine', p); },
+  spike(p) { tone(2900, 2300, 0.05, 0.09, 'triangle', p); tone(4200, 3800, 0.03, 0.04, 'sine', p, 0.03); },
+  moth()   { tone(880, 0, 0.12, 0.12, 'triangle'); tone(1320, 0, 0.18, 0.1, 'triangle', 0, 0.07); tone(1760, 0, 0.22, 0.07, 'sine', 0, 0.14); },
+  empty()  { tone(240, 200, 0.1, 0.06, 'square'); },
+  crash()  { noiseBurst(0.7, 0.6); tone(220, 40, 0.6, 0.25, 'sawtooth'); },
+};
+
+// ---------------------------------------------------------------------------
+// World state
+// ---------------------------------------------------------------------------
+let state = 'title';      // title | play | dead
+let paused = false;
+let samples = [], s0 = 0, gen;
+let spikes = [], moths = [], pings = [], parts = [];
+let camX, speed, bat, energy, mothCount, time, playT, shake, deadT, pingCd, lowFlash, nextMothX, demoPingT;
+let newBest = false;
+const dust = Array.from({ length: 55 }, () => ({ x: rand(0, 2000), y: rand(0, H), z: rand(0.15, 0.6), s: rand(0.6, 1.6) }));
+
+function reset() {
+  samples = []; s0 = 0; spikes = []; moths = []; pings = []; parts = [];
+  gen = { center: H / 2, target: H / 2, cnt: 40, lastSpike: 0 };
+  camX = 0; time = 0; playT = 0; energy = 100; mothCount = 0; shake = 0; deadT = 0;
+  pingCd = 0; lowFlash = 0; nextMothX = 700; demoPingT = 0.3; newBest = false;
+  bat = { x: Math.min(W * 0.25, 180), y: H / 2, vx: 0, vy: 0, tilt: 0 };
+  target.x = bat.x; target.y = bat.y;
+  ensureGen(W + 400);
+}
+
+function difficulty(x) { return clamp((x - 1500) / 70000, 0, 1); }
+
+function genSample(i) {
+  const x = i * STEP, d = difficulty(x);
+  let gap = lerp(380, 180, d) + Math.sin(x * 0.0021) * 25;
+  if (x < 1300) { gap = 430; gen.target = H / 2; }
+  else if (--gen.cnt <= 0) {
+    const m = gap / 2 + 22;
+    gen.target = rand(m, H - m);
+    gen.cnt = rand(18, 45) | 0;
+  }
+  const maxSlope = lerp(3, 6.5, d);
+  gen.center += clamp((gen.target - gen.center) * 0.05, -maxSlope, maxSlope);
+  const top = Math.max(14, gen.center - gap / 2 + rand(-5, 5));
+  const bot = Math.min(H - 14, gen.center + gap / 2 + rand(-5, 5));
+  // little speckles inside the rock, purely decorative
+  const dots = [[rand(-5, 5), rand(6, 40)], [rand(-5, 5), rand(10, 70)]];
+  samples.push({ x, top, bot, rt: -99, ra: 0, bt: -99, ba: 0, dots });
+
+  if (x > 1900 && i - gen.lastSpike > Math.round(lerp(42, 15, d)) && Math.random() < lerp(0.045, 0.13, d)) {
+    gen.lastSpike = i;
+    const fromTop = Math.random() < 0.5;
+    const len = (bot - top) * rand(0.28, lerp(0.42, 0.56, d));
+    const w = rand(13, 24);
+    const by = fromTop ? top : bot, dir = fromTop ? 1 : -1;
+    spikes.push({
+      x, fromTop, rt: -99, ra: 0, ax: x, ay: by + dir * len,
+      tri: [x - w, by - dir * 14, x + w, by - dir * 14, x + rand(-4, 4), by + dir * len],
+    });
+  }
+}
+
+function ensureGen(upTo) {
+  while (!samples.length || samples[samples.length - 1].x < upTo) genSample(s0 + samples.length);
+  while (samples.length > 2 && samples[1].x < camX - 120) { samples.shift(); s0++; }
+  spikes = spikes.filter(s => s.x > camX - 120);
+  moths = moths.filter(m => m.alive && m.x > camX - 120);
+  while (nextMothX < upTo - 50) {
+    const w = wallAt(nextMothX);
+    moths.push({ x: nextMothX, y: rand(w.top + 40, w.bot - 40), bx: nextMothX, ph: rand(0, 6.28), alive: true });
+    nextMothX += rand(380, 820);
+  }
+}
+
+function wallAt(x) {
+  const fi = x / STEP, i = Math.floor(fi);
+  const k = clamp(i - s0, 0, samples.length - 2);
+  const a = samples[k], b = samples[k + 1];
+  const t = clamp(fi - (k + s0), 0, 1);
+  return { top: lerp(a.top, b.top, t), bot: lerp(a.bot, b.bot, t) };
+}
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+const keys = new Set();
+const target = { x: 0, y: 0 };
+let inputMode = 'pointer';
+const touches = new Map();
+
+function toLogical(e) { return { x: e.clientX / scale, y: (e.clientY - offY) / scale }; }
+
+function action() {
+  initAudio();
+  if (paused) { paused = false; return; }
+  if (state === 'title') startGame();
+  else if (state === 'play') ping();
+  else if (state === 'dead' && deadT > 0.8) startGame();
+}
+
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(k)) e.preventDefault();
+  if (k === ' ' || k === 'enter') { if (!e.repeat) action(); return; }
+  if (k === 'p' || k === 'escape') { if (state === 'play') paused = !paused; return; }
+  if (k === 'm') { muted = !muted; if (master) master.gain.value = muted ? 0 : 0.55; return; }
+  if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'w', 'a', 's', 'd'].includes(k)) {
+    keys.add(k); inputMode = 'keys';
+  }
+});
+addEventListener('keyup', e => keys.delete(e.key.toLowerCase()));
+addEventListener('blur', () => { keys.clear(); if (state === 'play') paused = true; });
+
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  const p = toLogical(e);
+  if (e.pointerType === 'mouse') {
+    inputMode = 'pointer'; target.x = p.x; target.y = p.y;
+    action();
+    return;
+  }
+  initAudio();
+  touches.set(e.pointerId, { fx: p.x, fy: p.y, bx: bat ? bat.x : 0, by: bat ? bat.y : 0, t: performance.now(), moved: false });
+  if (state !== 'play' || paused) { action(); return; }
+  if (touches.size >= 2) ping();
+  inputMode = 'touch';
+});
+cv.addEventListener('pointermove', e => {
+  const p = toLogical(e);
+  if (e.pointerType === 'mouse') { if (inputMode !== 'keys' || Math.abs(e.movementX) + Math.abs(e.movementY) > 2) { inputMode = 'pointer'; } target.x = p.x; target.y = p.y; return; }
+  const t = touches.get(e.pointerId);
+  if (!t) return;
+  if (Math.hypot(p.x - t.fx, p.y - t.fy) > 10) t.moved = true;
+  // relative drag: your finger never covers the bat
+  if (touches.size === 1 || [...touches.keys()][0] === e.pointerId) {
+    target.x = t.bx + (p.x - t.fx) * 1.25;
+    target.y = t.by + (p.y - t.fy) * 1.25;
+  }
+});
+function endTouch(e) {
+  const t = touches.get(e.pointerId);
+  if (!t) return;
+  touches.delete(e.pointerId);
+  if (state === 'play' && !t.moved && performance.now() - t.t < 230 && touches.size === 0) ping();
+}
+cv.addEventListener('pointerup', endTouch);
+cv.addEventListener('pointercancel', e => touches.delete(e.pointerId));
+cv.addEventListener('contextmenu', e => e.preventDefault());
+
+// ---------------------------------------------------------------------------
+// Game flow
+// ---------------------------------------------------------------------------
+function startGame() {
+  reset();
+  state = 'play';
+  emitPing(true);
+}
+
+function emitPing(free) {
+  pings.push({ x: camX + bat.x, y: bat.y, r: 0, echoed: false });
+  if (!free) energy -= PING_COST;
+  sfx.ping();
+}
+
+function ping() {
+  if (state !== 'play' || paused || pingCd > 0) return;
+  if (energy < PING_COST) { sfx.empty(); lowFlash = 0.6; return; }
+  pingCd = 0.16;
+  emitPing(false);
+}
+
+function die() {
+  state = 'dead'; deadT = 0; shake = 14;
+  sfx.crash();
+  const wx = camX + bat.x;
+  for (let i = 0; i < 60; i++) {
+    const a = rand(0, Math.PI * 2), s = rand(40, 320);
+    parts.push({ x: wx, y: bat.y, vx: Math.cos(a) * s + speed * 0.3, vy: Math.sin(a) * s, life: rand(0.5, 1.4), max: 1.4, c: Math.random() < 0.5 ? '160,235,255' : '200,160,255' });
+  }
+  // one last scream: reveal what killed you
+  pings.push({ x: wx, y: bat.y, r: 0, echoed: true });
+  const dist = Math.floor(camX / 40);
+  if (dist > best) { best = dist; newBest = true; saveBest(); }
+}
+
+// ---------------------------------------------------------------------------
+// Update
+// ---------------------------------------------------------------------------
+function update(dt) {
+  time += dt;
+  shake = Math.max(0, shake - dt * 30);
+  lowFlash = Math.max(0, lowFlash - dt);
+  pingCd = Math.max(0, pingCd - dt);
+
+  if (state === 'play' || state === 'title') {
+    speed = state === 'title' ? 150 : 165 + 175 * difficulty(camX);
+    camX += speed * dt;
+    ensureGen(camX + W + 400);
+  }
+
+  if (state === 'play') {
+    playT += dt;
+    energy = Math.min(100, energy + 6.5 * dt);
+    steerBat(dt);
+  } else if (state === 'title') {
+    demoAI(dt);
+  } else {
+    deadT += dt;
+  }
+
+  // dust drifts with parallax
+  for (const m of dust) {
+    if (state !== 'dead') m.x -= speed * m.z * dt;
+    if (m.x < -5) { m.x += W + 10; m.y = rand(0, H); }
+  }
+
+  // echoes
+  for (const p of pings) {
+    const pr = p.r;
+    p.r += PING_SPEED * dt;
+    const r = p.r;
+    const inten = clamp(1.05 - r / PING_MAX, 0.25, 1);
+    const k0 = Math.max(0, Math.floor((p.x - r) / STEP) - s0);
+    const k1 = Math.min(samples.length - 1, Math.ceil((p.x + r) / STEP) - s0);
+    for (let k = k0; k <= k1; k++) {
+      const s = samples[k], dx = s.x - p.x;
+      const dt_ = Math.hypot(dx, s.top - p.y);
+      if (dt_ >= pr && dt_ < r) { s.rt = time; s.ra = inten; hitEcho(p, s.x); }
+      const db = Math.hypot(dx, s.bot - p.y);
+      if (db >= pr && db < r) { s.bt = time; s.ba = inten; hitEcho(p, s.x); }
+    }
+    for (const sp of spikes) {
+      const d = Math.hypot(sp.ax - p.x, sp.ay - p.y);
+      if (d >= pr && d < r) {
+        sp.rt = time; sp.ra = inten;
+        if (state === 'play') sfx.spike(panOf(sp.x));
+      }
+    }
+  }
+  pings = pings.filter(p => p.r < PING_MAX);
+
+  // moths
+  for (const m of moths) {
+    m.ph += dt;
+    m.x = m.bx + Math.sin(m.ph * 1.3) * 18;
+    const w = wallAt(m.x);
+    m.y = clamp(m.y + Math.sin(m.ph * 2.7) * 40 * dt, w.top + 22, w.bot - 22);
+    if (state === 'play' && m.alive && Math.hypot(m.x - (camX + bat.x), m.y - bat.y) < 20) {
+      m.alive = false; mothCount++;
+      energy = Math.min(100, energy + 35);
+      sfx.moth();
+      for (let i = 0; i < 18; i++) {
+        const a = rand(0, 6.28), s = rand(30, 140);
+        parts.push({ x: m.x, y: m.y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(0.3, 0.8), max: 0.8, c: '255,214,120' });
+      }
+    }
+  }
+
+  for (const p of parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 220 * dt; p.vx *= 0.985; p.life -= dt; }
+  parts = parts.filter(p => p.life > 0);
+
+  if (state === 'play') checkCollision();
+}
+
+function panOf(wx) { return clamp(((wx - camX) / W) * 2 - 1, -1, 1); }
+function hitEcho(p, x) {
+  if (p.echoed) return;
+  p.echoed = true;
+  if (state === 'play') sfx.echo(panOf(x));
+}
+
+function steerBat(dt) {
+  if (inputMode === 'keys') {
+    const ax = (keys.has('arrowright') || keys.has('d')) - (keys.has('arrowleft') || keys.has('a'));
+    const ay = (keys.has('arrowdown') || keys.has('s')) - (keys.has('arrowup') || keys.has('w'));
+    bat.vx += ax * 2600 * dt; bat.vy += ay * 2600 * dt;
+    const damp = Math.exp(-5.5 * dt);
+    bat.vx *= damp; bat.vy *= damp;
+  } else {
+    target.x = clamp(target.x, 24, W * 0.72);
+    target.y = clamp(target.y, 8, H - 8);
+    const dvx = clamp((target.x - bat.x) * 7, -430, 430);
+    const dvy = clamp((target.y - bat.y) * 7, -430, 430);
+    const k = Math.min(1, 10 * dt);
+    bat.vx += (dvx - bat.vx) * k; bat.vy += (dvy - bat.vy) * k;
+  }
+  const sp = Math.hypot(bat.vx, bat.vy);
+  if (sp > 430) { bat.vx *= 430 / sp; bat.vy *= 430 / sp; }
+  bat.x = clamp(bat.x + bat.vx * dt, 24, W * 0.72);
+  bat.y = clamp(bat.y + bat.vy * dt, 8, H - 8);
+  bat.tilt = lerp(bat.tilt, clamp(bat.vy / 900, -0.35, 0.35), Math.min(1, 8 * dt));
+}
+
+function demoAI(dt) {
+  const ahead = camX + bat.x + 110;
+  const w = wallAt(ahead);
+  let ty = (w.top + w.bot) / 2;
+  for (const sp of spikes) {
+    if (sp.x > camX + bat.x - 20 && sp.x < camX + bat.x + 200) {
+      const ws = wallAt(sp.x);
+      ty = sp.fromTop ? (sp.ay + ws.bot) / 2 : (ws.top + sp.ay) / 2;
+      break;
+    }
+  }
+  bat.vy += ((ty - bat.y) * 5 - bat.vy) * Math.min(1, 6 * dt);
+  bat.y += bat.vy * dt;
+  bat.tilt = lerp(bat.tilt, clamp(bat.vy / 900, -0.35, 0.35), Math.min(1, 8 * dt));
+  demoPingT -= dt;
+  if (demoPingT <= 0) { demoPingT = 1.15; pings.push({ x: camX + bat.x, y: bat.y, r: 0, echoed: true }); }
+}
+
+function circleTri(px, py, r, t) {
+  const [ax, ay, bx, by, cx, cy] = t;
+  const s1 = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+  const s2 = (cx - bx) * (py - by) - (cy - by) * (px - bx);
+  const s3 = (ax - cx) * (py - cy) - (ay - cy) * (px - cx);
+  if ((s1 >= 0 && s2 >= 0 && s3 >= 0) || (s1 <= 0 && s2 <= 0 && s3 <= 0)) return true;
+  return segDist(px, py, ax, ay, bx, by) < r || segDist(px, py, bx, by, cx, cy) < r || segDist(px, py, cx, cy, ax, ay) < r;
+}
+function segDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const t = clamp(((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy), 0, 1);
+  return Math.hypot(px - (ax + dx * t), py - (ay + dy * t));
+}
+
+function checkCollision() {
+  const bx = camX + bat.x, by = bat.y;
+  for (const o of [-5, 0, 5]) {
+    const w = wallAt(bx + o);
+    if (by - BAT_R < w.top || by + BAT_R > w.bot) { die(); return; }
+  }
+  for (const sp of spikes) {
+    if (Math.abs(sp.x - bx) < 45 && circleTri(bx, by, BAT_R - 1, sp.tri)) { die(); return; }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+let lights = [];
+function vis(rt, ra, x, y) {
+  const age = time - rt;
+  let a = 0;
+  if (age < FADE) {
+    const f = 1 - age / FADE;
+    a = ra * f * f;
+    if (age < 0.08) a = Math.min(1, a + 0.5 * (1 - age / 0.08)); // reveal flash
+  }
+  for (const L of lights) {
+    const d = Math.hypot(x - L.x, y - L.y);
+    if (d < L.r) { const n = (1 - d / L.r); a = Math.max(a, n * n * L.s); }
+  }
+  return a;
+}
+
+function drawWalls() {
+  const k0 = Math.max(0, Math.floor((camX - 20) / STEP) - s0);
+  const k1 = Math.min(samples.length - 2, Math.ceil((camX + W + 20) / STEP) - s0);
+  const vt = [], vb = [];
+  for (let k = k0; k <= k1 + 1; k++) {
+    const s = samples[k];
+    vt[k] = vis(s.rt, s.ra, s.x, s.top);
+    vb[k] = vis(s.bt, s.ba, s.x, s.bot);
+  }
+  ctx.lineCap = 'round';
+  for (let k = k0; k <= k1; k++) {
+    const s = samples[k], n = samples[k + 1];
+    const at = (vt[k] + vt[k + 1]) / 2, ab = (vb[k] + vb[k + 1]) / 2;
+    if (at > 0.01) {
+      ctx.fillStyle = `rgba(22,58,78,${at * 0.45})`;
+      ctx.beginPath(); ctx.moveTo(s.x, s.top); ctx.lineTo(n.x + 0.6, n.top); ctx.lineTo(n.x + 0.6, 0); ctx.lineTo(s.x, 0); ctx.fill();
+      ctx.fillStyle = `rgba(120,210,240,${at * 0.35})`;
+      for (const [dx, dy] of s.dots) if (s.top - dy > 0) ctx.fillRect(s.x + dx, s.top - dy, 1.6, 1.6);
+      ctx.strokeStyle = `rgba(70,190,255,${at * 0.18})`; ctx.lineWidth = 7;
+      ctx.beginPath(); ctx.moveTo(s.x, s.top); ctx.lineTo(n.x, n.top); ctx.stroke();
+      ctx.strokeStyle = `rgba(175,240,255,${at})`; ctx.lineWidth = 1.7;
+      ctx.beginPath(); ctx.moveTo(s.x, s.top); ctx.lineTo(n.x, n.top); ctx.stroke();
+    }
+    if (ab > 0.01) {
+      ctx.fillStyle = `rgba(22,58,78,${ab * 0.45})`;
+      ctx.beginPath(); ctx.moveTo(s.x, s.bot); ctx.lineTo(n.x + 0.6, n.bot); ctx.lineTo(n.x + 0.6, H); ctx.lineTo(s.x, H); ctx.fill();
+      ctx.fillStyle = `rgba(120,210,240,${ab * 0.35})`;
+      for (const [dx, dy] of s.dots) if (s.bot + dy < H) ctx.fillRect(s.x + dx, s.bot + dy, 1.6, 1.6);
+      ctx.strokeStyle = `rgba(70,190,255,${ab * 0.18})`; ctx.lineWidth = 7;
+      ctx.beginPath(); ctx.moveTo(s.x, s.bot); ctx.lineTo(n.x, n.bot); ctx.stroke();
+      ctx.strokeStyle = `rgba(175,240,255,${ab})`; ctx.lineWidth = 1.7;
+      ctx.beginPath(); ctx.moveTo(s.x, s.bot); ctx.lineTo(n.x, n.bot); ctx.stroke();
+    }
+  }
+}
+
+function drawSpikes() {
+  for (const sp of spikes) {
+    if (sp.x < camX - 40 || sp.x > camX + W + 40) continue;
+    const a = vis(sp.rt, sp.ra, sp.ax, sp.ay);
+    if (a < 0.01) continue;
+    const t = sp.tri;
+    ctx.beginPath(); ctx.moveTo(t[0], t[1]); ctx.lineTo(t[4], t[5]); ctx.lineTo(t[2], t[3]); ctx.closePath();
+    ctx.fillStyle = `rgba(48,30,62,${a * 0.75})`; ctx.fill();
+    ctx.beginPath(); ctx.moveTo(t[0], t[1]); ctx.lineTo(t[4], t[5]); ctx.lineTo(t[2], t[3]);
+    ctx.strokeStyle = `rgba(255,120,190,${a * 0.2})`; ctx.lineWidth = 7; ctx.stroke();
+    ctx.strokeStyle = `rgba(255,185,220,${a})`; ctx.lineWidth = 1.7; ctx.stroke();
+  }
+}
+
+function glow(x, y, r, rgb, a) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+  g.addColorStop(0, `rgba(${rgb},${a})`);
+  g.addColorStop(1, `rgba(${rgb},0)`);
+  ctx.fillStyle = g;
+  ctx.fillRect(x - r, y - r, r * 2, r * 2);
+}
+
+function drawMoths() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const m of moths) {
+    if (!m.alive || m.x < camX - 30 || m.x > camX + W + 30) continue;
+    const fl = 0.75 + 0.25 * Math.sin(m.ph * 11) * Math.sin(m.ph * 4.3);
+    glow(m.x, m.y, 34, '255,200,90', 0.28 * fl);
+    const wf = Math.abs(Math.sin(m.ph * 26)) * 4 + 1;
+    ctx.fillStyle = `rgba(255,236,180,${0.9 * fl})`;
+    ctx.beginPath(); ctx.ellipse(m.x - 3, m.y, 3, wf, -0.4, 0, 6.29); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(m.x + 3, m.y, 3, wf, 0.4, 0, 6.29); ctx.fill();
+    ctx.fillStyle = '#fff6dc';
+    ctx.beginPath(); ctx.arc(m.x, m.y, 1.8, 0, 6.29); ctx.fill();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawBat(x, y, tilt, t) {
+  ctx.globalCompositeOperation = 'lighter';
+  glow(x, y, 70, '90,190,255', 0.07);
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(tilt);
+  const f = Math.sin(t * 19);
+  ctx.fillStyle = '#1b1530';
+  ctx.strokeStyle = 'rgba(170,225,255,0.75)';
+  ctx.lineWidth = 1;
+  for (const s of [-1, 1]) {
+    ctx.beginPath();
+    ctx.moveTo(3 * s, -3);
+    ctx.lineTo(9 * s, -8 - f * 5);
+    ctx.lineTo(20 * s, -5 - f * 11);
+    ctx.quadraticCurveTo(17 * s, -1 - f * 6, 14 * s, 1 - f * 4);
+    ctx.quadraticCurveTo(11 * s, -1 - f * 3, 8 * s, 2 - f * 2);
+    ctx.quadraticCurveTo(5 * s, 1, 3 * s, 3);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(1.2 * s, -5); ctx.lineTo(3 * s, -11); ctx.lineTo(3.8 * s, -4); ctx.closePath(); ctx.fill(); ctx.stroke();
+  }
+  ctx.beginPath(); ctx.ellipse(0, 0, 4.6, 7, 0, 0, 6.29); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#d6fbff';
+  ctx.fillRect(-2.4, -3.6, 1.5, 1.5); ctx.fillRect(0.9, -3.6, 1.5, 1.5);
+  ctx.restore();
+}
+
+function drawPings() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of pings) {
+    const a = (1 - p.r / PING_MAX);
+    ctx.strokeStyle = `rgba(110,220,255,${a * 0.28})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.29); ctx.stroke();
+    ctx.strokeStyle = `rgba(110,220,255,${a * 0.08})`;
+    ctx.lineWidth = 10;
+    ctx.beginPath(); ctx.arc(p.x, p.y, Math.max(0, p.r - 8), 0, 6.29); ctx.stroke();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function drawParts() {
+  ctx.globalCompositeOperation = 'lighter';
+  for (const p of parts) {
+    ctx.fillStyle = `rgba(${p.c},${clamp(p.life / p.max, 0, 1)})`;
+    ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
+  }
+  ctx.globalCompositeOperation = 'source-over';
+}
+
+function text(str, x, y, size, color, align = 'center', weight = 600) {
+  ctx.font = `${weight} ${size}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle';
+  ctx.fillStyle = color;
+  ctx.fillText(str, x, y);
+}
+
+function drawHUD() {
+  const dist = Math.floor(camX / 40);
+  text(`${dist} m`, 18, 28, 20, 'rgba(190,240,255,0.9)', 'left');
+  ctx.globalCompositeOperation = 'lighter';
+  glow(26, 56, 12, '255,200,90', 0.5);
+  ctx.globalCompositeOperation = 'source-over';
+  text(`× ${mothCount}`, 40, 56, 15, 'rgba(255,225,160,0.9)', 'left');
+  text(`best ${best} m`, W - 18, 28, 14, 'rgba(160,200,220,0.55)', 'right', 500);
+
+  // echo energy
+  const bw = Math.min(200, W * 0.36), bx = W / 2 - bw / 2, by = 22;
+  const ok = energy >= PING_COST;
+  const flash = lowFlash > 0 && Math.sin(lowFlash * 30) > 0;
+  ctx.fillStyle = 'rgba(255,255,255,0.07)';
+  ctx.fillRect(bx, by, bw, 8);
+  ctx.fillStyle = flash ? 'rgba(255,90,120,0.9)' : ok ? 'rgba(110,220,255,0.85)' : 'rgba(110,160,190,0.5)';
+  ctx.fillRect(bx, by, bw * energy / 100, 8);
+  ctx.fillStyle = 'rgba(0,0,0,0.8)';
+  for (let e = PING_COST; e < 100; e += PING_COST) ctx.fillRect(bx + bw * e / 100 - 1, by, 2, 8);
+  text('ECHO', W / 2, by + 20, 10, 'rgba(160,220,255,0.5)', 'center', 500);
+
+  if (playT < 7) {
+    const a = Math.min(1, playT) * Math.min(1, 7 - playT);
+    const touchy = inputMode === 'touch';
+    text(touchy ? 'TAP to echolocate  ·  DRAG to fly' : 'SPACE / CLICK to echolocate', W / 2, H - 60, 15, `rgba(190,240,255,${0.8 * a})`);
+    text('the walls exist only while you can hear them', W / 2, H - 36, 12, `rgba(160,200,220,${0.55 * a})`, 'center', 400);
+  }
+}
+
+function drawTitle() {
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.fillRect(0, 0, W, H);
+  const cx = W / 2, cy = H * 0.36;
+  ctx.globalCompositeOperation = 'lighter';
+  for (let i = 0; i < 3; i++) {
+    const ph = ((time * 0.5 + i / 3) % 1);
+    ctx.strokeStyle = `rgba(110,220,255,${(1 - ph) * 0.35})`;
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(cx, cy, 30 + ph * 240, 0, 6.29); ctx.stroke();
+  }
+  ctx.globalCompositeOperation = 'source-over';
+  const size = Math.min(56, W / 9);
+  text('ECHOES BELOW', cx, cy, size, '#dff8ff', 'center', 800);
+  text('You are a bat. It is pitch black.', cx, cy + 50, 15, 'rgba(190,235,255,0.85)', 'center', 400);
+  text('The cave only exists when you hear it.', cx, cy + 72, 15, 'rgba(190,235,255,0.85)', 'center', 400);
+
+  const ly = H * 0.66;
+  text('move   mouse · WASD/arrows · drag', cx, ly, 13, 'rgba(160,210,230,0.7)', 'center', 400);
+  text('echo   click · space · tap', cx, ly + 22, 13, 'rgba(160,210,230,0.7)', 'center', 400);
+  text('eat glowing moths to recharge your voice', cx, ly + 44, 13, 'rgba(255,215,150,0.75)', 'center', 400);
+  const blink = 0.55 + 0.45 * Math.sin(time * 4);
+  text('click · tap · space to fly', cx, H * 0.88, 17, `rgba(223,248,255,${blink})`);
+  if (best) text(`best ${best} m`, cx, H * 0.94, 12, 'rgba(160,200,220,0.5)', 'center', 400);
+}
+
+function drawDead() {
+  const a = Math.min(1, deadT * 1.5);
+  ctx.fillStyle = `rgba(0,0,0,${0.55 * a})`;
+  ctx.fillRect(0, 0, W, H);
+  const cx = W / 2, cy = H * 0.4;
+  text('you met the dark', cx, cy, Math.min(40, W / 12), `rgba(255,190,215,${a})`, 'center', 700);
+  text(`${Math.floor(camX / 40)} m   ·   ${mothCount} moth${mothCount === 1 ? '' : 's'}`, cx, cy + 48, 18, `rgba(200,240,255,${a})`);
+  text(newBest ? '✦ new best ✦' : `best ${best} m`, cx, cy + 78, 14, newBest ? `rgba(255,220,140,${a})` : `rgba(160,200,220,${a * 0.6})`, 'center', 500);
+  if (deadT > 0.8) {
+    const blink = 0.55 + 0.45 * Math.sin(time * 4);
+    text('click · tap · space to fly again', cx, H * 0.75, 16, `rgba(223,248,255,${blink})`);
+  }
+}
+
+function draw() {
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  const sx = shake ? rand(-shake, shake) : 0, sy = shake ? rand(-shake, shake) : 0;
+  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, sx * dpr, offY * dpr + sy * dpr);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
+
+  ctx.fillStyle = '#020306';
+  ctx.fillRect(0, 0, W, H);
+  for (const m of dust) {
+    ctx.fillStyle = `rgba(150,200,230,${0.05 + m.z * 0.08})`;
+    ctx.fillRect(m.x, m.y, m.s, m.s);
+  }
+
+  const bwx = camX + bat.x;
+  lights = [];
+  if (state !== 'dead') lights.push({ x: bwx, y: bat.y, r: 105, s: 0.5 });
+  for (const m of moths) if (m.alive && m.x > camX - 80 && m.x < camX + W + 80) lights.push({ x: m.x, y: m.y, r: 85, s: 0.32 });
+
+  ctx.save();
+  ctx.translate(-camX, 0);
+  drawWalls();
+  drawSpikes();
+  drawPings();
+  drawMoths();
+  if (state !== 'dead') drawBat(bwx, bat.y, bat.tilt, time);
+  drawParts();
+  ctx.restore();
+
+  if (state === 'play') drawHUD();
+  else if (state === 'title') drawTitle();
+  else drawDead();
+
+  if (paused) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)'; ctx.fillRect(0, 0, W, H);
+    text('paused', W / 2, H / 2 - 10, 30, '#dff8ff', 'center', 700);
+    text('click · tap · space to resume', W / 2, H / 2 + 26, 13, 'rgba(160,210,230,0.7)', 'center', 400);
+  }
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+reset();
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  if (!paused) update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// expose a tiny hook for automated smoke tests
+window.__echoes = { get state() { return state; }, get camX() { return camX; } };
+})();
+</script>
+</body>
+</html>
